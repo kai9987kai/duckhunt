@@ -1,297 +1,369 @@
+#!/usr/bin/env python
+"""
 ######################################################
 #                   DuckHunter                       #
 #                 Pedro M. Sosa                      #
 # Tool to prevent getting attacked by a rubberducky! #
 ######################################################
 
-from ctypes import *
-import pythoncom
-import pyHook
-import win32clipboard
-import win32ui
+This script monitors keyboard input to detect potential key injection attacks 
+(e.g., via a "rubberducky"). It supports four protection policies:
+    - Paranoid: Blocks further input until the correct password is entered.
+    - Normal: Temporarily disallows keyboard input when an attack is detected.
+    - Sneaky: Drops some keys to disrupt the attack.
+    - LogOnly: Simply logs the attack without interfering with input.
+
+A Tkinter GUI provides controls for starting/stopping the script, configuring
+startup options, and displaying an "About" window.
+
+Usage:
+    - Configure settings in duckhunt.conf.
+    - Run as a windowless .pyw (or use py2exe/pyinstaller to build an .exe).
+"""
+
 import os
-import shutil
-from time import gmtime, strftime
-from sys import stdout
-from Tkinter import *
-from ttk import *
-import imp
-import webbrowser
+import sys
+import time
 import getpass
+import logging
+import webbrowser
+import pythoncom
 
+# For Python 3, use "import pyWinhook as pyHook" (if installed) instead of pyHook.
+import pyHook  
 
-duckhunt = imp.load_source('duckhunt', 'duckhunt.conf')
-##### NOTES #####
-#
-# 1. Undestanding Protection Policy:
-#   - Paranoid: When an  attack is detected, lock down any further keypresses until the correct password is entered. (set password in .conf file). Attack will also be logged.
-#   - Normal :  When an attack is detected, keyboard input will temporarily be disallowed. (After it is deemed that the treat is over, keyboard input will be allowed again). Attack will also be logged.
-#   - Sneaky: When an attacks is detected, a few keys will be dropped (enough to break any attack, make it look as if the attacker messed up.) Attack will also be logged.
-#   - LogOnly: When an attack is detected, simply log the attack and in no way stop it. 
+try:
+    # For Python 3, use import tkinter and tkinter.ttk
+    from tkinter import Tk, Menu, Button, Toplevel
+    from tkinter import messagebox
+except ImportError:
+    # Python 2 fallback
+    from Tkinter import Tk, Menu, Button, Toplevel
+    import tkMessageBox as messagebox
 
-# 2. How To Use
-#   - Modify the user configurable vars below. (particularly policy and password)
-#   - Turn the program into a .pyw to run it as windowless script.
-#   - (Opt) Use py2exe to build an .exe
-#
-#################
+# Use importlib instead of deprecated imp module.
+import importlib.util
 
+# -------------------------------
+# Load configuration from duckhunt.conf
+# -------------------------------
+def load_config(config_path='duckhunt.conf'):
+    spec = importlib.util.spec_from_file_location("duckhunt", config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    return config_module
 
-threshold = duckhunt.threshold  # Speed Threshold
-size = duckhunt.size  # Size of history array
-policy = duckhunt.policy.lower()  # Designate Policy Type
-password = duckhunt.password  # Password used in Paranoid Mode
-allow_auto_type_software = duckhunt.allow_auto_type_software  # Allow AutoType Software (eg. KeyPass or LastPass)
-################################################################################
-pcounter = 0  # Password Counter (If using password)
-speed = 0  # Current Average Keystroke Speed
-prevTime = -1  # Previous Keypress Timestamp
-i = 0  # History Array Timeslot
-intrusion = False  # Boolean Flag to be raised in case of intrusion detection
-history = [threshold + 1] * size  # Array for keeping track of average speeds across the last n keypresses
-randdrop = duckhunt.randdrop  # How often should one drop a letter (in Sneaky mode)
-prevWindow = []  # What was the previous window
-filename = duckhunt.filename  # Filename to save attacks
-blacklist = duckhunt.blacklist  # Program Blacklist
+config = load_config()
 
+# Global configuration variables
+THRESHOLD = config.threshold                  # Speed threshold (ms)
+HISTORY_SIZE = config.size                    # Size of history array
+POLICY = config.policy.lower()                # Policy type: paranoid, normal, sneaky, log
+PASSWORD = config.password                    # Password for Paranoid mode
+ALLOW_AUTO = config.allow_auto_type_software   # Allow auto-type software (e.g., KeyPass)
+RANDDROP_INTERVAL = config.randdrop           # For Sneaky mode (drop every nth key)
+LOG_FILENAME = config.filename                # Log file path
+BLACKLIST = [w.strip() for w in config.blacklist.split(",") if w.strip()]
 
-# Logging the Attack
-def log(event):
-    global prevWindow
+# Setup logging for attacks
+logging.basicConfig(
+    filename=LOG_FILENAME,
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-    x = open(filename, "a+")
-    if (prevWindow != event.WindowName):
-        x.write("\n[ %s ]\n" % (event.WindowName))
-        prevWindow = event.WindowName
-    if event.Ascii > 32 and event.Ascii < 127:
-        x.write(chr(event.Ascii))
-    else:
-        x.write("[%s]" % event.Key)
-        x.close()
-    return
+# -------------------------------
+# DuckHunterHook Class
+# -------------------------------
+class DuckHunterHook:
+    def __init__(self):
+        # State variables for key injection detection
+        self.threshold = THRESHOLD
+        self.history = [self.threshold + 1] * HISTORY_SIZE
+        self.history_index = 0
+        self.prev_time = -1
+        self.average_speed = 0.0
+        self.is_intrusion = False
+        self.policy = POLICY
+        self.password = PASSWORD
+        self.password_counter = 0
+        self.randdrop_counter = 0
+        self.allow_auto = ALLOW_AUTO
+        self.blacklist = BLACKLIST
+        self.last_window = ""
+        # Create a hook manager
+        self.hm = pyHook.HookManager()
+        self.hm.KeyDown = self.on_key_down
 
+    def log_event(self, event):
+        """Log the key event (window name and key pressed)."""
+        try:
+            if self.last_window != event.WindowName:
+                logging.info("\n[ %s ]", event.WindowName)
+                self.last_window = event.WindowName
+            if 32 < event.Ascii < 127:
+                logging.info("%s", chr(event.Ascii))
+            else:
+                logging.info("[%s]", event.Key)
+        except Exception as e:
+            logging.exception("Logging error: %s", e)
 
-def caught(event):
-    global intrusion, policy, randdrop
-    print("Quack! Quack! -- Time to go Duckhunting!")
-    intrusion = True;
+    def handle_intrusion(self, event):
+        """Handle intrusion based on the active policy."""
+        print("Quack! Quack! -- Time to go Duckhunting!")
+        self.is_intrusion = True
 
-    # Paranoid Policy
-    if (policy == "paranoid"):
-        win32ui.MessageBox(
-            "Someone might be trying to inject keystrokes into your computer.\nPlease check your ports or any strange programs running.\nEnter your Password to unlock keyboard.",
-            "KeyInjection Detected", 4096)  # MB_SYSTEMMODAL = 4096 -- Always on top.
-        return False;
-    # Sneaky Policy
-    elif (policy == "sneaky"):
-        randdrop += 1
-        # Drop every 5th letter
-        if (randdrop == 7):
-            randdrop = 0;
-            return False;
-        else:
-            return True;
+        if self.policy == "paranoid":
+            # Block input until correct password is entered.
+            messagebox.showinfo("KeyInjection Detected",
+                                "Someone might be trying to inject keystrokes into your computer.\n"
+                                "Please check your ports or any strange programs running.\n"
+                                "Enter your password to unlock keyboard.")
+            return False
 
-    # Logging Only Policy
-    elif (policy == "log"):
-        log(event)
-        return True;
+        elif self.policy == "sneaky":
+            self.randdrop_counter += 1
+            # Drop every nth keystroke (e.g., every 7th key)
+            if self.randdrop_counter % RANDDROP_INTERVAL == 0:
+                return False
+            return True
 
-    # Normal Policy
-    log(event)
-    return False
+        elif self.policy == "logonly":
+            self.log_event(event)
+            return True
 
-
-# This is triggered every time a key is pressed
-def KeyStroke(event):
-    global threshold, policy, password, pcounter
-    global speed, prevTime, i, history, intrusion, blacklist
-
-    print(event.Key)
-    print(event.Message)
-    print("Injected", event.Injected)
-
-    if (event.Injected != 0 and allow_auto_type_software):
-        print("Injected by Software")
-        return True;
-
-    # If an intrusion was detected and we are password protecting
-    # Then lockdown any keystroke and until password is entered
-    if (policy == "paranoid" and intrusion):
-        print(event.Key)
-        log(event);
-        if (password[pcounter] == chr(event.Ascii)):
-            pcounter += 1;
-            if (pcounter == len(password)):
-                win32ui.MessageBox("Correct Password!", "KeyInjection Detected",
-                                   4096)  # MB_SYSTEMMODAL = 4096 -- Always on top.
-                intrusion = False
-                pcounter = 0
-        else:
-            pcounter = 0
-
+        # Normal policy: log event and block this keystroke.
+        self.log_event(event)
         return False
 
-    # Initial Condition
-    if (prevTime == -1):
-        prevTime = event.Time;
+    def on_key_down(self, event):
+        """
+        Called for every key press event.
+        Processes keystroke timing, checks for injection, and applies the active policy.
+        """
+        # Debug output
+        # print("Key:", event.Key, "Injected:", event.Injected, "Window:", event.WindowName)
+        if event.Injected and self.allow_auto:
+            print("Injected by auto-type software; allowed.")
+            return True
+
+        # In Paranoid mode, if intrusion is flagged, require password input.
+        if self.policy == "paranoid" and self.is_intrusion:
+            self.log_event(event)
+            try:
+                char = chr(event.Ascii)
+            except Exception:
+                char = ''
+            if self.password and self.password[self.password_counter] == char:
+                self.password_counter += 1
+                if self.password_counter == len(self.password):
+                    messagebox.showinfo("KeyInjection Detected", "Correct Password! Keyboard unlocked.")
+                    self.is_intrusion = False
+                    self.password_counter = 0
+            else:
+                self.password_counter = 0
+            return False
+
+        # Initialize prev_time on first keypress.
+        if self.prev_time == -1:
+            self.prev_time = event.Time
+            return True
+
+        # Compute interval (keystroke speed)
+        interval = event.Time - self.prev_time
+        self.prev_time = event.Time
+        self.history[self.history_index] = interval
+        self.history_index = (self.history_index + 1) % len(self.history)
+        self.average_speed = sum(self.history) / float(len(self.history))
+        print("Average Speed:", self.average_speed)
+
+        # Check if the active window is blacklisted.
+        for window in self.blacklist:
+            if window and window in event.WindowName:
+                return self.handle_intrusion(event)
+
+        # If the average speed is below the threshold, treat as an intrusion.
+        if self.average_speed < self.threshold:
+            return self.handle_intrusion(event)
+        else:
+            self.is_intrusion = False
+
         return True
 
-    if (i >= len(history)): i = 0;
+    def start(self):
+        """Install the keyboard hook and start the message pump."""
+        self.hm.HookKeyboard()
+        try:
+            pythoncom.PumpMessages()
+        except Exception as e:
+            logging.exception("Error in message pump: %s", e)
+            sys.exit(1)
 
-    # TypeSpeed = NewKeyTime - OldKeyTime
-    history[i] = event.Time - prevTime
-    print(event.Time, "-", prevTime, "=", history[i])
-    prevTime = event.Time
-    speed = sum(history) / float(len(history))
-    i = i + 1
+# -------------------------------
+# DuckHunterGUI Class
+# -------------------------------
+class DuckHunterGUI:
+    def __init__(self):
+        self.root = Tk()
+        self.root.title("DuckHunter")
+        try:
+            # Use a custom icon if available.
+            self.root.iconbitmap('favicon.ico')
+        except Exception:
+            pass
+        self.root.resizable(False, False)
+        self.root.geometry("300x45+300+300")
+        self.root.attributes("-topmost", True)
+        self.username = getpass.getuser()
+        self.dir_path = os.path.dirname(os.path.realpath(__file__))
+        self.create_menu()
+        self.create_widgets()
 
-    print("\rAverage Speed:", speed)
+    def create_menu(self):
+        """Create the application menu."""
+        menubar = Menu(self.root)
+        # Main Menu
+        main_menu = Menu(menubar, tearoff=0)
+        main_menu.add_command(label="START", command=self.start_hook)
+        main_menu.add_command(label="CLOSE", command=self.stop_script)
+        main_menu.add_separator()
+        main_menu.add_command(label="ABOUT", command=self.show_about)
+        menubar.add_cascade(label="Menu", menu=main_menu)
+        # Settings Menu
+        settings_menu = Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="RUN SCRIPT ON STARTUP", command=self.add_to_startup)
+        settings_menu.add_command(label="FULLSCREEN", command=self.fullscreen)
+        settings_menu.add_command(label="HIDE TITLE BAR", command=self.hide_title_bar)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        self.root.config(menu=menubar)
 
-    # Blacklisting
-    for window in blacklist.split(","):
-        if window in event.WindowName:
-            return caught(event)
+    def create_widgets(self):
+        """Create buttons on the main window."""
+        btn_start = Button(self.root, text="Start", command=self.start_hook)
+        btn_close = Button(self.root, text="Close", command=self.stop_script)
+        btn_start.grid(column=1, row=0, padx=5, pady=5)
+        btn_close.grid(column=2, row=0, padx=5, pady=5)
+        btn_startup = Button(self.root, text="RUN SCRIPT ON STARTUP", command=self.add_to_startup)
+        btn_startup.grid(column=3, row=0, padx=5, pady=5)
 
-    # Intrusion detected
-    if (speed < threshold):
-        return caught(event)
-    else:
-        intrusion = False
-    # pass execution to next hook registered
-    return True
+    def stop_script(self):
+        """Stop the script and exit."""
+        self.root.destroy()
+        sys.exit(0)
 
-
-# create and register a hook manager
-kl = pyHook.HookManager()
-kl.KeyDown = KeyStroke
-
-
-def window():
-    window = Tk()
-    
-    def StopScript():
-        exit(0)
-
-    def About():
+    def show_about(self):
+        """Open the project's About page in the default browser."""
         webbrowser.open_new(r"https://github.com/pmsosa/duckhunt/blob/master/README.md")
-    def WindowStarted():
-        def HideWindow():
-            window1.destroy()
-            def add_to_startup(file_path=dir_path):
-                if file_path == "":
-                    file_path = os.path.dirname(os.path.realpath(__file__))
-                    bat_path = r'C:\Users\%s\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' % USER_NAME
-                    with open(bat_path + '\\' + "duckhunt.bat", "w+") as bat_file:
-                         bat_file.write(r'start "" %s''\builds\duckhunt.0.9.exe' % file_path)
-        
-       
-        def FullScreen():
-            window1.attributes('-fullscreen', True)
-            window1.bind('<Escape>', lambda e: root.destroy())
-            
-        
-        def HideTitleBar():
-            window1.overrideredirect(True)
-        
-        
-        window1 = Tk()
-        window1.title("DuckHunter")
-        window1.iconbitmap('favicon.ico')
-        window1.geometry('310x45')
-        window1.resizable(False, False)
-        window1.geometry("+300+300")
-        window1.attributes("-topmost", True)
-        menu = Menu(window1)
-        new_item = Menu(menu)
-        new_item.add_command(label='STOP SCRIPT', command =StopScript)
-        new_item.add_command(label='CLOSE WINDOW', command =HideWindow)
-        new_item.add_separator()
-        new_item.add_command(label='ABOUT', command =About)
-        menu.add_cascade(label='Menu', menu=new_item)
-        window1.config(menu=menu) 
-        btn = Button(window1, text="Stop Script", command=StopScript)
-        btn1 = Button(window1, text="Close Window", command=HideWindow)
-        btn2 = Button(window1, text="RUN SCRIPT ON STARTUP", command=add_to_startup)
-        new_item2 = Menu(menu)
-        new_item2.add_command(label='RUN SCRIPT ON STARTUP', command =add_to_startup)
-        new_item2.add_command(label='FULLSCREEN', command =FullScreen)
-        new_item2.add_command(label='HIDE TITLE BAR', command =HideTitleBar)
-        menu.add_cascade(label='Settings', menu=new_item2)
-        btn2.grid(column=3, row=0)
-        btn.grid(column=1, row=0)
-        btn1.grid(column=2, row=0)
 
-        window1.mainloop()
-        
-        
- 
-    def start():
-        window.destroy()
-        WindowStarted()
-        kl.HookKeyboard()
-        pythoncom.PumpMessages()
-    USER_NAME = getpass.getuser()
-    dir_path = os.path.dirname(os.path.realpath(__file__))
+    def fullscreen(self):
+        """Set the window to fullscreen."""
+        self.root.attributes('-fullscreen', True)
+        self.root.bind('<Escape>', lambda e: self.root.attributes('-fullscreen', False))
 
+    def hide_title_bar(self):
+        """Remove the window title bar."""
+        self.root.overrideredirect(True)
 
-    def FullScreen():
-        window.attributes('-fullscreen', True)
-        window.bind('<Escape>', lambda e: root.destroy())
-    def HideTitleBar():
-        window.overrideredirect(True)
+    def add_to_startup(self):
+        """Create a batch file to add the script to Windows startup."""
+        bat_dir = r'C:\Users\%s\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' % self.username
+        bat_file_path = os.path.join(bat_dir, "duckhunt.bat")
+        # Adjust the path to your built executable or script as needed.
+        with open(bat_file_path, "w+") as bat_file:
+            bat_file.write(r'start "" "%s\AutoRunDuckHunt.exe"' % self.dir_path)
+        messagebox.showinfo("Startup", "DuckHunter has been added to startup.")
 
+    def start_hook(self):
+        """Start the hook and hide the main window (or launch a secondary control window)."""
+        self.root.destroy()
+        gui = DuckHunterControlWindow()
+        gui.start()
 
-            
-        
-    def add_to_startup(file_path=dir_path):
-        if file_path == "":
-            file_path = os.path.dirname(os.path.realpath(__file__))
-        bat_path = r'C:\Users\%s\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' % USER_NAME
-        with open(bat_path + '\\' + "duckhunt.bat", "w+") as bat_file:
-            bat_file.write(r'start "" %s''\AutoRunDuckHunt.exe' % file_path)        
-                            
-                    
-        
+    def run(self):
+        """Run the GUI main loop."""
+        self.root.mainloop()
 
+# -------------------------------
+# DuckHunterControlWindow Class
+# -------------------------------
+class DuckHunterControlWindow:
+    """
+    A secondary control window that appears after starting the hook.
+    It provides additional controls such as 'Stop Script', 'Close Window',
+    and settings for startup, fullscreen, etc.
+    """
+    def __init__(self):
+        self.window = Toplevel()
+        self.window.title("DuckHunter")
+        try:
+            self.window.iconbitmap('favicon.ico')
+        except Exception:
+            pass
+        self.window.geometry("310x45+300+300")
+        self.window.resizable(False, False)
+        self.window.attributes("-topmost", True)
+        self.create_menu()
+        self.create_widgets()
 
+    def create_menu(self):
+        menubar = Menu(self.window)
+        main_menu = Menu(menubar, tearoff=0)
+        main_menu.add_command(label="STOP SCRIPT", command=self.stop_script)
+        main_menu.add_command(label="CLOSE WINDOW", command=self.window.destroy)
+        main_menu.add_separator()
+        main_menu.add_command(label="ABOUT", command=self.show_about)
+        menubar.add_cascade(label="Menu", menu=main_menu)
+        settings_menu = Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="RUN SCRIPT ON STARTUP", command=self.add_to_startup)
+        settings_menu.add_command(label="FULLSCREEN", command=self.fullscreen)
+        settings_menu.add_command(label="HIDE TITLE BAR", command=self.hide_title_bar)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        self.window.config(menu=menubar)
 
+    def create_widgets(self):
+        btn_stop = Button(self.window, text="Stop Script", command=self.stop_script)
+        btn_close = Button(self.window, text="Close Window", command=self.window.destroy)
+        btn_startup = Button(self.window, text="RUN SCRIPT ON STARTUP", command=self.add_to_startup)
+        btn_stop.grid(column=1, row=0, padx=5, pady=5)
+        btn_close.grid(column=2, row=0, padx=5, pady=5)
+        btn_startup.grid(column=3, row=0, padx=5, pady=5)
 
-    window.title("DuckHunter")
-    window.iconbitmap('favicon.ico')
-    window.resizable(False, False)
-    window.geometry('300x45')
-    window.geometry("+300+300")
-    window.attributes("-topmost", True)
-    menu = Menu(window)
-    new_item = Menu(menu)
-    new_item.add_command(label='START', command =start)
-    new_item.add_command(label='CLOSE', command =StopScript)
-    new_item.add_separator()
-    new_item.add_command(label='ABOUT', command =About)
-    menu.add_cascade(label='Menu', menu=new_item)
-    new_item2 = Menu(menu)
-    new_item2.add_command(label='RUN SCRIPT ON STARTUP', command =add_to_startup)
-    new_item2.add_command(label='FULLSCREEN', command =FullScreen)
-    new_item2.add_command(label='HIDE TITLE BAR', command =HideTitleBar)
-    menu.add_cascade(label='Settings', menu=new_item2)
-    window.config(menu=menu)
-    btn = Button(window, text="Start", command=start)
-    btn.grid(column=1, row=0)
-    btn = Button(window, text="Close", command=StopScript)
-    btn.grid(column=2, row=0)
-    btn = Button(window, text="RUN SCRIPT ON STARTUP", command=add_to_startup)
-    btn.grid(column=3, row=0)
+    def stop_script(self):
+        self.window.destroy()
+        sys.exit(0)
 
+    def show_about(self):
+        webbrowser.open_new(r"https://github.com/pmsosa/duckhunt/blob/master/README.md")
 
-    window.mainloop()
+    def fullscreen(self):
+        self.window.attributes('-fullscreen', True)
+        self.window.bind('<Escape>', lambda e: self.window.attributes('-fullscreen', False))
 
+    def hide_title_bar(self):
+        self.window.overrideredirect(True)
 
+    def add_to_startup(self):
+        username = getpass.getuser()
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        bat_dir = r'C:\Users\%s\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup' % username
+        bat_file_path = os.path.join(bat_dir, "duckhunt.bat")
+        with open(bat_file_path, "w+") as bat_file:
+            bat_file.write(r'start "" "%s\builds\duckhunt.0.9.exe"' % dir_path)
+        messagebox.showinfo("Startup", "DuckHunter has been added to startup.")
 
-    # register the hook and execute forever
+    def start(self):
+        """Start the keyboard hook and begin message pumping."""
+        hook = DuckHunterHook()
+        hook.start()
 
+# -------------------------------
+# Main Execution
+# -------------------------------
+def main():
+    # Start the GUI which in turn starts the hook.
+    gui = DuckHunterGUI()
+    gui.run()
 
-window()
-
-
-
+if __name__ == '__main__':
+    main()
