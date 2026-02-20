@@ -195,6 +195,12 @@ STATUS_FLUSH_INTERVAL = as_int(getattr(config, "status_flush_interval", 250), 25
 LOG_MAX_BYTES = as_int(getattr(config, "log_max_bytes", 1048576), 1048576, minimum=0)
 LOG_BACKUP_COUNT = as_int(getattr(config, "log_backup_count", 5), 5, minimum=1)
 
+# Warmup mode: avoid blocking on speed heuristics during startup calibration.
+WARMUP_EVENTS = as_int(getattr(config, "warmup_events", 0), 0, minimum=0)
+WARMUP_ACTION = str(getattr(config, "warmup_action", "logonly")).strip().lower()
+if WARMUP_ACTION not in ("logonly", "enforce"):
+    WARMUP_ACTION = "logonly"
+
 configure_logging(LOG_FILENAME, LOG_LEVEL, LOG_MAX_BYTES, LOG_BACKUP_COUNT)
 
 
@@ -233,6 +239,8 @@ class DuckHunter:
         self.status_filename = STATUS_FILENAME.strip()
         self.status_flush_interval = STATUS_FLUSH_INTERVAL
         self.events_since_flush = 0
+        self.warmup_events = WARMUP_EVENTS
+        self.warmup_action = WARMUP_ACTION
 
         self.debug = DEBUG
 
