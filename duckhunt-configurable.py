@@ -373,6 +373,40 @@ class DuckHunter:
                 return "pattern_match:{}".format("->".join(signature))
         return ""
 
+    def in_warmup_phase(self):
+        return self.warmup_events > 0 and self.total_events <= self.warmup_events
+
+    def should_enforce_during_warmup(self, reason):
+        if reason == "blacklisted_window":
+            return True
+        if reason.startswith("pattern_match"):
+            return True
+        return False
+
+    def handle_warmup_intrusion(self, event, reason):
+        warmup_reason = "warmup_{}".format(reason)
+        self.intrusion_count += 1
+        self.last_intrusion_reason = warmup_reason
+        self.last_intrusion_window = event.WindowName or ""
+        self.last_intrusion_key = event.Key or ""
+        self.last_intrusion_at_ms = int(time.time() * 1000)
+        self.log_intrusion(event, warmup_reason)
+        self.log_attack(event)
+        return True
+
+    def trigger_intrusion(self, event, reason):
+        if (
+            self.in_warmup_phase() and
+            self.warmup_action == "logonly" and
+            not self.should_enforce_during_warmup(reason)
+        ):
+            result = self.handle_warmup_intrusion(event, reason)
+        else:
+            result = self.handle_intrusion(event, reason)
+
+        self.record_decision(result, force_status=True)
+        return result
+
     def record_decision(self, allowed, force_status=False):
         if allowed:
             self.allowed_events += 1
@@ -417,6 +451,8 @@ class DuckHunter:
             "adaptive_samples": len(self.baseline_intervals),
             "low_variance_detection": self.low_variance_detection,
             "low_variance_streak": self.low_variance_counter,
+            "warmup_events": self.warmup_events,
+            "warmup_remaining_events": max(0, self.warmup_events - self.total_events),
         }
 
     def handle_intrusion(self, event, reason):
@@ -556,9 +592,7 @@ class DuckHunter:
         )
 
         if self.is_window_blacklisted(window_name):
-            result = self.handle_intrusion(event, "blacklisted_window")
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, "blacklisted_window")
 
         if (
             event.Injected and
@@ -569,30 +603,20 @@ class DuckHunter:
             return True
 
         if self.rapid_burst_count > 0 and self.rapid_burst_counter >= self.rapid_burst_count:
-            result = self.handle_intrusion(event, "rapid_burst")
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, "rapid_burst")
 
         if self.injected_burst_count > 0 and self.injected_burst_counter >= self.injected_burst_count:
-            result = self.handle_intrusion(event, "injected_burst")
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, "injected_burst")
 
         if self.low_variance_counter >= self.low_variance_streak_count:
-            result = self.handle_intrusion(event, "low_variance_burst")
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, "low_variance_burst")
 
         pattern_reason = self.pattern_match_reason()
         if pattern_reason:
-            result = self.handle_intrusion(event, pattern_reason)
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, pattern_reason)
 
         if self.average_speed < self.active_threshold:
-            result = self.handle_intrusion(event, "average_speed")
-            self.record_decision(result, force_status=True)
-            return result
+            return self.trigger_intrusion(event, "average_speed")
 
         self.is_intrusion = False
         self.remember_clean_interval(interval, event)

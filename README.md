@@ -37,6 +37,7 @@
  - Structured intrusion logs with reason + context for easier analysis.
  - Live runtime status telemetry (optional JSON export) and pause/resume controls.
  - Rotating log support to cap disk usage on long-running installs.
+ - Optional warmup calibration mode to reduce startup false positives.
  
 <h3>Setup</h3>
 
@@ -70,7 +71,7 @@
   -  You can also tune advanced protection variables:
      `normal_lockout_ms`, `rapid_burst_interval_ms`, `rapid_burst_count`, `injected_burst_count`, `whitelist`,
      `pattern_signatures`, `adaptive_threshold_enabled`, `adaptive_*`, `low_variance_*`,
-     `window_threshold_overrides`, `status_filename`, and `log_max_bytes`
+     `window_threshold_overrides`, `status_filename`, `log_max_bytes`, and `warmup_*`
 - Step 2. Turn the duckhunt-configurable**.py** to a duckhunt-configurable**.pyw** so that the console doesn't show up when you run the program
 - Step 3. (opt) Use Py2Exe to create an executable.
 - Step 4. Run the program. You are now protected from RubberDuckies!
