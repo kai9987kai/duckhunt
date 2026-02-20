@@ -27,6 +27,10 @@
 **Extras**
  - Program Blacklist: If there are specific programs you never use (cmd, PowerShell). Consider interactions with them as highly suspicious and take action based on the protection policy.
  - Support for AutoType software (eg. KeePass, LastPass, Breevy)
+ - Whitelist support for trusted windows/workflows that should bypass checks.
+ - Advanced burst detection (rapid interval streak and injected-event streak).
+ - Temporary lockout timer in Normal mode to better absorb attack bursts.
+ - Structured intrusion logs with reason + context for easier analysis.
  
 <h3>Setup</h3>
 
@@ -57,6 +61,8 @@
 
 - Step 1. Customize duckhunt.conf variables to your desire
   -  You can customize the password, speed threshold, privacy, etc.
+  -  You can also tune advanced protection variables:
+     `normal_lockout_ms`, `rapid_burst_interval_ms`, `rapid_burst_count`, `injected_burst_count`, and `whitelist`
 - Step 2. Turn the duckhunt-configurable**.py** to a duckhunt-configurable**.pyw** so that the console doesn't show up when you run the program
 - Step 3. (opt) Use Py2Exe to create an executable.
 - Step 4. Run the program. You are now protected from RubberDuckies!
