@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 """
 ######################################################
 #                   DuckHunter                       #
@@ -20,6 +20,7 @@ import time
 import webbrowser
 from collections import deque
 from ctypes import windll
+from logging.handlers import RotatingFileHandler
 
 import pythoncom
 
@@ -124,6 +125,29 @@ def parse_pattern_signatures(value):
     return signatures
 
 
+def parse_window_threshold_overrides(value):
+    """Parse 'window:threshold' pairs separated by ';'."""
+    overrides = []
+    if value is None:
+        return overrides
+
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = str(value).split(";")
+
+    for item in raw_items:
+        chunk = str(item).strip()
+        if not chunk or ":" not in chunk:
+            continue
+        name, threshold_text = chunk.split(":", 1)
+        token = name.strip().lower()
+        threshold = as_int(threshold_text.strip(), default=-1, minimum=1)
+        if token and threshold > 0:
+            overrides.append((token, threshold))
+    return overrides
+
+
 def show_system_message(title, body):
     try:
         windll.user32.MessageBoxW(0, body, title, 0x00001000)
@@ -137,6 +161,25 @@ def current_tick_ms():
         return int(windll.kernel32.GetTickCount64())
     except AttributeError:
         return int(windll.kernel32.GetTickCount())
+
+
+def configure_logging(filename, level_name, max_bytes, backup_count):
+    logger = logging.getLogger()
+    logger.handlers = []
+    logger.setLevel(getattr(logging, level_name, logging.INFO))
+
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    if max_bytes > 0:
+        handler = RotatingFileHandler(filename, maxBytes=max_bytes, backupCount=backup_count)
+    else:
+        handler = logging.FileHandler(filename)
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 config = load_config()
@@ -168,18 +211,22 @@ ADAPTIVE_SAMPLE_SIZE = as_int(getattr(config, "adaptive_sample_size", 140), 140,
 ADAPTIVE_MULTIPLIER = as_float(getattr(config, "adaptive_multiplier", 0.35), 0.35, minimum=0.05)
 ADAPTIVE_FLOOR_MS = as_int(getattr(config, "adaptive_floor_ms", 12), 12, minimum=1)
 ADAPTIVE_CEILING_MS = as_int(getattr(config, "adaptive_ceiling_ms", 90), 90, minimum=ADAPTIVE_FLOOR_MS)
+WINDOW_THRESHOLD_OVERRIDES = parse_window_threshold_overrides(getattr(config, "window_threshold_overrides", ""))
+
+# Low-variance detector for machine-like key bursts.
+LOW_VARIANCE_DETECTION = as_bool(getattr(config, "low_variance_detection", True), default=True)
+LOW_VARIANCE_STDDEV_MS = as_float(getattr(config, "low_variance_stddev_ms", 2.5), 2.5, minimum=0.1)
+LOW_VARIANCE_SPEED_CEILING_MS = as_int(getattr(config, "low_variance_speed_ceiling_ms", 55), 55, minimum=1)
+LOW_VARIANCE_STREAK_COUNT = as_int(getattr(config, "low_variance_streak_count", 6), 6, minimum=1)
 
 # Optional runtime status export and temporary pause controls
 STATUS_FILENAME = str(getattr(config, "status_filename", ""))
 STATUS_FLUSH_INTERVAL = as_int(getattr(config, "status_flush_interval", 250), 250, minimum=1)
 PAUSE_DURATION_MS = as_int(getattr(config, "pause_duration_ms", 30000), 30000, minimum=1000)
+LOG_MAX_BYTES = as_int(getattr(config, "log_max_bytes", 1048576), 1048576, minimum=0)
+LOG_BACKUP_COUNT = as_int(getattr(config, "log_backup_count", 5), 5, minimum=1)
 
-logging.basicConfig(
-    filename=LOG_FILENAME,
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='[%(asctime)s] %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+configure_logging(LOG_FILENAME, LOG_LEVEL, LOG_MAX_BYTES, LOG_BACKUP_COUNT)
 
 
 def startup_directory_for_user():
@@ -239,6 +286,7 @@ class DuckHunterHook:
         self.injected_burst_count = INJECTED_BURST_COUNT
         self.pattern_signatures = PATTERN_SIGNATURES
         self.key_buffer = deque(maxlen=KEY_BUFFER_SIZE)
+        self.window_threshold_overrides = WINDOW_THRESHOLD_OVERRIDES
 
         self.adaptive_threshold_enabled = ADAPTIVE_THRESHOLD_ENABLED
         self.adaptive_min_samples = ADAPTIVE_MIN_SAMPLES
@@ -247,6 +295,12 @@ class DuckHunterHook:
         self.adaptive_ceiling_ms = ADAPTIVE_CEILING_MS
         self.baseline_intervals = deque(maxlen=ADAPTIVE_SAMPLE_SIZE)
         self.effective_threshold = self.threshold
+        self.active_threshold = self.threshold
+
+        self.low_variance_detection = LOW_VARIANCE_DETECTION
+        self.low_variance_stddev = LOW_VARIANCE_STDDEV_MS
+        self.low_variance_speed_ceiling = LOW_VARIANCE_SPEED_CEILING_MS
+        self.low_variance_streak_count = LOW_VARIANCE_STREAK_COUNT
 
         self.status_filename = STATUS_FILENAME.strip()
         self.status_flush_interval = STATUS_FLUSH_INTERVAL
@@ -259,7 +313,9 @@ class DuckHunterHook:
         self.history = [self.threshold + 1] * self.history_size
         self.history_index = 0
         self.history_total = float(sum(self.history))
+        self.history_square_total = float(sum(value * value for value in self.history))
         self.average_speed = self.history_total / self.history_size
+        self.interval_stddev = 0.0
 
         self.prev_time = -1
         self.is_intrusion = False
@@ -269,6 +325,7 @@ class DuckHunterHook:
         self.normal_block_until = 0
         self.rapid_burst_counter = 0
         self.injected_burst_counter = 0
+        self.low_variance_counter = 0
 
         self.total_events = 0
         self.allowed_events = 0
@@ -297,12 +354,25 @@ class DuckHunterHook:
         lowered = (window_name or "").lower()
         return any(token in lowered for token in self.blacklist)
 
+    def get_window_threshold_override(self, window_name):
+        lowered = (window_name or "").lower()
+        for token, threshold in self.window_threshold_overrides:
+            if token in lowered:
+                return threshold
+        return None
+
     def update_interval_metrics(self, interval):
         old_value = self.history[self.history_index]
         self.history[self.history_index] = interval
         self.history_index = (self.history_index + 1) % self.history_size
         self.history_total += interval - old_value
+        self.history_square_total += (interval * interval) - (old_value * old_value)
         self.average_speed = self.history_total / float(self.history_size)
+        mean = self.average_speed
+        variance = (self.history_square_total / float(self.history_size)) - (mean * mean)
+        if variance < 0:
+            variance = 0
+        self.interval_stddev = variance ** 0.5
 
     def compute_effective_threshold(self):
         if not self.adaptive_threshold_enabled:
@@ -344,14 +414,18 @@ class DuckHunterHook:
     def log_intrusion(self, event, reason):
         logging.warning(
             "Intrusion detected reason=%s policy=%s avg_interval_ms=%.2f threshold_ms=%d "
-            "effective_threshold_ms=%d rapid_streak=%d injected_streak=%d window=%r key=%r injected=%r",
+            "effective_threshold_ms=%d active_threshold_ms=%d stddev_ms=%.2f "
+            "rapid_streak=%d injected_streak=%d low_variance_streak=%d window=%r key=%r injected=%r",
             reason,
             self.policy,
             self.average_speed,
             self.threshold,
             self.effective_threshold,
+            self.active_threshold,
+            self.interval_stddev,
             self.rapid_burst_counter,
             self.injected_burst_counter,
+            self.low_variance_counter,
             event.WindowName,
             event.Key,
             event.Injected,
@@ -401,7 +475,9 @@ class DuckHunterHook:
             "policy": self.policy,
             "threshold_ms": self.threshold,
             "effective_threshold_ms": self.effective_threshold,
+            "active_threshold_ms": self.active_threshold,
             "average_speed_ms": round(self.average_speed, 2),
+            "interval_stddev_ms": round(self.interval_stddev, 3),
             "total_events": self.total_events,
             "allowed_events": self.allowed_events,
             "blocked_events": self.blocked_events,
@@ -412,6 +488,8 @@ class DuckHunterHook:
             "pause_remaining_ms": pause_remaining_ms,
             "adaptive_threshold_enabled": self.adaptive_threshold_enabled,
             "adaptive_samples": len(self.baseline_intervals),
+            "low_variance_detection": self.low_variance_detection,
+            "low_variance_streak": self.low_variance_counter,
         }
 
     def pause_protection(self, duration_ms=None):
@@ -534,16 +612,31 @@ class DuckHunterHook:
             self.key_buffer.append(key_name)
 
         self.effective_threshold = self.compute_effective_threshold()
+        threshold_override = self.get_window_threshold_override(window_name)
+        self.active_threshold = threshold_override if threshold_override is not None else self.effective_threshold
+
+        if (
+            self.low_variance_detection and
+            self.average_speed <= self.low_variance_speed_ceiling and
+            self.interval_stddev <= self.low_variance_stddev
+        ):
+            self.low_variance_counter += 1
+        else:
+            self.low_variance_counter = 0
 
         self.debug_log(
-            "event key=%r injected=%r interval=%d avg=%.2f rapid=%d injected_streak=%d effective=%d",
+            "event key=%r injected=%r interval=%d avg=%.2f stddev=%.3f "
+            "rapid=%d injected_streak=%d low_variance=%d effective=%d active=%d",
             event.Key,
             event.Injected,
             interval,
             self.average_speed,
+            self.interval_stddev,
             self.rapid_burst_counter,
             self.injected_burst_counter,
+            self.low_variance_counter,
             self.effective_threshold,
+            self.active_threshold,
         )
 
         if self.is_window_blacklisted(window_name):
@@ -569,13 +662,18 @@ class DuckHunterHook:
             self.record_decision(result, force_status=True)
             return result
 
+        if self.low_variance_counter >= self.low_variance_streak_count:
+            result = self.handle_intrusion(event, "low_variance_burst")
+            self.record_decision(result, force_status=True)
+            return result
+
         pattern_reason = self.pattern_match_reason()
         if pattern_reason:
             result = self.handle_intrusion(event, pattern_reason)
             self.record_decision(result, force_status=True)
             return result
 
-        if self.average_speed < self.effective_threshold:
+        if self.average_speed < self.active_threshold:
             result = self.handle_intrusion(event, "average_speed")
             self.record_decision(result, force_status=True)
             return result
@@ -788,13 +886,14 @@ class DuckHunterControlWindow(BaseWindowMixin):
         status = self.hook.get_status_snapshot()
         mode = "paused" if status["pause_remaining_ms"] > 0 else "active"
         text = (
-            "Status: {} | Intrusions: {} | Blocked: {} | Avg: {}ms | Effective threshold: {}ms"
+            "Status: {} | Intrusions: {} | Blocked: {} | Avg: {}ms | StdDev: {} | Threshold: {}ms"
             .format(
                 mode,
                 status["intrusion_count"],
                 status["blocked_events"],
                 status["average_speed_ms"],
-                status["effective_threshold_ms"],
+                status["interval_stddev_ms"],
+                status["active_threshold_ms"],
             )
         )
         if status["pause_remaining_ms"] > 0:
