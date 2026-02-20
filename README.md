@@ -1,6 +1,6 @@
 <h1>DuckHunter</h1>
 <h3>Prevent RubberDucky (or other keystroke injection) attacks</h3>
-<h3>Try Out the new setup GUI it helps you to setup the software and we have just released a new feature that allows you to run the script every time your computer starts automatically<h3>
+<h3>Try out the new setup GUI, which helps you to set up the software, and we have just released a new feature that allows you to run the script every time your computer starts automatically<h3>
 
 
 
@@ -10,22 +10,22 @@
 
 **Read this program's postmortem at my [blog](http://konukoii.com/blog/2016/10/26/duckhunting-stopping-automated-keystroke-injection-attacks/)**
 <h3>Intro</h3>
-[Rubberduckies](https://hakshop.myshopify.com/products/usb-rubber-ducky-deluxe) are small usb devices that pretend to be usb keyboards and can type on their own at very high speeds. Because most -if not all- OS trust keyboards automatically, it is hard to protect oneself from these attacks.
+[Rubberduckies](https://hakshop.myshopify.com/products/usb-rubber-ducky-deluxe) are small USB devices that pretend to be USB keyboards and can type on their own at very high speeds. Because most -if not all- OS trust keyboards automatically, it is hard to protect oneself from these attacks.
 
-**DuckHunt** is a small efficient script that acts as a daemon consistently monitoring your keyboard usage (right now, speed and selected window) that can catch and prevent a rubber ducky attack. (Technically it helps prevent any type of automated keystroke injection attack, so things like Mousejack injections are also covered.)
+**DuckHunt** is a small, efficient script that acts as a daemon consistently monitoring your keyboard usage (right now, speed and selected window) that can catch and prevent a rubber ducky attack. (Technically, it helps prevent any type of automated keystroke injection attack, so things like Mousejack injections are also covered.)
 
 ![](http://konukoii.com/blog/wp-content/uploads/2016/10/duckhunt-screenshot.png)
 
 <h3>Features</h3>
 
 **Protection Policy**
- - **Paranoid:** When an attack is detected, keyboard input is disallowed until a password is input. Attack will also be logged.
- - **Normal:** When an attack is detected, keyboard input will temporarily be disallowed. (After it is deemed that the treat is over, keyboard input will be allowed again). Attack will also be logged.
- - **Sneaky:** When an attacks is detected, a few keys will be dropped (enough to break any attack, make it look as if the attacker messed up.) Attack will also be logged.
+ - **Paranoid:** When an attack is detected, keyboard input is disallowed until a password is entered. Attack will also be logged.
+ - **Normal:** When an attack is detected, keyboard input will temporarily be disallowed. (After it is deemed that the treat is over, keyboard input will be allowed again. Attack will also be logged.
+ - **Sneaky:** When an attack is detected, a few keys will be dropped (enough to break any attack, make it look as if the attacker messed up.) Attack will also be logged.
  - **LogOnly:** When an attack is detected, simply log the attack and in no way stop it. 
 
 **Extras**
- - Program Blacklist: If there are specific programs you neve use (cmd, powershell). Consider interactions with them as highly suspecious and take action based on the protection policy.
+ - Program Blacklist: If there are specific programs you never use (cmd, PowerShell). Consider interactions with them as highly suspicious and take action based on the protection policy.
  - Support for AutoType software (eg. KeePass, LastPass, Breevy)
  
 <h3>Setup</h3>
@@ -52,7 +52,7 @@
 
 
 
-
+ 
 <h3>Advanced Setup</h3>
 
 - Step 1. Customize duckhunt.conf variables to your desire
@@ -65,7 +65,8 @@
 
 - More monitoring features: 
  - Add OSX & Linux support!
- - Look for certain patterns (eg. "GUI D, GUI R, cmd, ENTER")
+ - Look for certain patterns (eg, "GUI D, GUI R, cmd, ENTER")
+ - Quality of life updates
 
  
  <h1>Happy Hunting!</h1>
