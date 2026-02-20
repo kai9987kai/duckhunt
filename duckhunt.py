@@ -10,11 +10,15 @@ This script monitors keyboard input to detect potential keystroke injection atta
 """
 
 import importlib.util
+import json
 import logging
 import os
+import statistics
 import sys
 import threading
+import time
 import webbrowser
+from collections import deque
 from ctypes import windll
 
 import pythoncom
@@ -66,6 +70,16 @@ def as_int(value, default, minimum=None):
     return parsed
 
 
+def as_float(value, default, minimum=None):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and parsed < minimum:
+        return minimum
+    return parsed
+
+
 def as_csv_list(value):
     if value is None:
         return []
@@ -85,6 +99,46 @@ def normalize_policy(raw_policy):
     return "normal"
 
 
+def normalize_key_name(key_name):
+    return str(key_name or "").strip().replace(" ", "").upper()
+
+
+def parse_pattern_signatures(value):
+    signatures = []
+    if value is None:
+        return signatures
+
+    if isinstance(value, (list, tuple)):
+        raw_groups = value
+    else:
+        raw_groups = str(value).split(";")
+
+    for group in raw_groups:
+        if isinstance(group, (list, tuple)):
+            tokens = [normalize_key_name(token) for token in group]
+        else:
+            tokens = [normalize_key_name(token) for token in str(group).split(",")]
+        tokens = [token for token in tokens if token]
+        if len(tokens) >= 2:
+            signatures.append(tuple(tokens))
+    return signatures
+
+
+def show_system_message(title, body):
+    try:
+        windll.user32.MessageBoxW(0, body, title, 0x00001000)
+    except Exception:
+        logging.warning("Unable to display alert dialog: %s", body)
+
+
+def current_tick_ms():
+    # Keyboard event timestamps are based on system uptime, not wall-clock epoch.
+    try:
+        return int(windll.kernel32.GetTickCount64())
+    except AttributeError:
+        return int(windll.kernel32.GetTickCount())
+
+
 config = load_config()
 
 THRESHOLD = as_int(getattr(config, "threshold", 30), 30, minimum=1)
@@ -99,11 +153,26 @@ WHITELIST = [item.lower() for item in as_csv_list(getattr(config, "whitelist", "
 LOG_LEVEL = str(getattr(config, "log_level", "INFO")).upper()
 DEBUG = as_bool(getattr(config, "debug", False), default=False)
 
-# Advanced options (all backward-compatible defaults)
+# Advanced options
 NORMAL_LOCKOUT_MS = as_int(getattr(config, "normal_lockout_ms", 1200), 1200, minimum=0)
 RAPID_BURST_INTERVAL_MS = as_int(getattr(config, "rapid_burst_interval_ms", 12), 12, minimum=1)
 RAPID_BURST_COUNT = as_int(getattr(config, "rapid_burst_count", 8), 8, minimum=0)
 INJECTED_BURST_COUNT = as_int(getattr(config, "injected_burst_count", 0), 0, minimum=0)
+
+# Optional signature + adaptive detection
+PATTERN_SIGNATURES = parse_pattern_signatures(getattr(config, "pattern_signatures", ""))
+KEY_BUFFER_SIZE = as_int(getattr(config, "key_buffer_size", 18), 18, minimum=4)
+ADAPTIVE_THRESHOLD_ENABLED = as_bool(getattr(config, "adaptive_threshold_enabled", False), default=False)
+ADAPTIVE_MIN_SAMPLES = as_int(getattr(config, "adaptive_min_samples", 40), 40, minimum=5)
+ADAPTIVE_SAMPLE_SIZE = as_int(getattr(config, "adaptive_sample_size", 140), 140, minimum=ADAPTIVE_MIN_SAMPLES)
+ADAPTIVE_MULTIPLIER = as_float(getattr(config, "adaptive_multiplier", 0.35), 0.35, minimum=0.05)
+ADAPTIVE_FLOOR_MS = as_int(getattr(config, "adaptive_floor_ms", 12), 12, minimum=1)
+ADAPTIVE_CEILING_MS = as_int(getattr(config, "adaptive_ceiling_ms", 90), 90, minimum=ADAPTIVE_FLOOR_MS)
+
+# Optional runtime status export and temporary pause controls
+STATUS_FILENAME = str(getattr(config, "status_filename", ""))
+STATUS_FLUSH_INTERVAL = as_int(getattr(config, "status_flush_interval", 250), 250, minimum=1)
+PAUSE_DURATION_MS = as_int(getattr(config, "pause_duration_ms", 30000), 30000, minimum=1000)
 
 logging.basicConfig(
     filename=LOG_FILENAME,
@@ -168,6 +237,23 @@ class DuckHunterHook:
         self.rapid_burst_interval = RAPID_BURST_INTERVAL_MS
         self.rapid_burst_count = RAPID_BURST_COUNT
         self.injected_burst_count = INJECTED_BURST_COUNT
+        self.pattern_signatures = PATTERN_SIGNATURES
+        self.key_buffer = deque(maxlen=KEY_BUFFER_SIZE)
+
+        self.adaptive_threshold_enabled = ADAPTIVE_THRESHOLD_ENABLED
+        self.adaptive_min_samples = ADAPTIVE_MIN_SAMPLES
+        self.adaptive_multiplier = ADAPTIVE_MULTIPLIER
+        self.adaptive_floor_ms = ADAPTIVE_FLOOR_MS
+        self.adaptive_ceiling_ms = ADAPTIVE_CEILING_MS
+        self.baseline_intervals = deque(maxlen=ADAPTIVE_SAMPLE_SIZE)
+        self.effective_threshold = self.threshold
+
+        self.status_filename = STATUS_FILENAME.strip()
+        self.status_flush_interval = STATUS_FLUSH_INTERVAL
+        self.pause_duration_ms = PAUSE_DURATION_MS
+        self.pause_until = 0
+        self.events_since_flush = 0
+
         self.debug = DEBUG
 
         self.history = [self.threshold + 1] * self.history_size
@@ -183,6 +269,15 @@ class DuckHunterHook:
         self.normal_block_until = 0
         self.rapid_burst_counter = 0
         self.injected_burst_counter = 0
+
+        self.total_events = 0
+        self.allowed_events = 0
+        self.blocked_events = 0
+        self.intrusion_count = 0
+        self.last_intrusion_reason = ""
+        self.last_intrusion_window = ""
+        self.last_intrusion_key = ""
+        self.last_intrusion_at_ms = 0
 
         self.thread_id = None
         self.running = False
@@ -209,6 +304,30 @@ class DuckHunterHook:
         self.history_total += interval - old_value
         self.average_speed = self.history_total / float(self.history_size)
 
+    def compute_effective_threshold(self):
+        if not self.adaptive_threshold_enabled:
+            self.effective_threshold = self.threshold
+            return self.effective_threshold
+
+        if len(self.baseline_intervals) < self.adaptive_min_samples:
+            self.effective_threshold = self.threshold
+            return self.effective_threshold
+
+        baseline_median = statistics.median(self.baseline_intervals)
+        adaptive_value = baseline_median * self.adaptive_multiplier
+        adaptive_value = max(self.adaptive_floor_ms, min(self.adaptive_ceiling_ms, adaptive_value))
+
+        blended_threshold = (self.threshold + adaptive_value) / 2.0
+        self.effective_threshold = int(round(max(self.threshold, blended_threshold)))
+        return self.effective_threshold
+
+    def remember_clean_interval(self, interval, event):
+        if event.Injected:
+            return
+        if interval <= 0:
+            return
+        self.baseline_intervals.append(interval)
+
     def log_event(self, event):
         try:
             window_name = event.WindowName or "<unknown>"
@@ -225,11 +344,12 @@ class DuckHunterHook:
     def log_intrusion(self, event, reason):
         logging.warning(
             "Intrusion detected reason=%s policy=%s avg_interval_ms=%.2f threshold_ms=%d "
-            "rapid_streak=%d injected_streak=%d window=%r key=%r injected=%r",
+            "effective_threshold_ms=%d rapid_streak=%d injected_streak=%d window=%r key=%r injected=%r",
             reason,
             self.policy,
             self.average_speed,
             self.threshold,
+            self.effective_threshold,
             self.rapid_burst_counter,
             self.injected_burst_counter,
             event.WindowName,
@@ -237,9 +357,80 @@ class DuckHunterHook:
             event.Injected,
         )
 
+    def pattern_match_reason(self):
+        if not self.pattern_signatures:
+            return ""
+
+        buffer_list = list(self.key_buffer)
+        for signature in self.pattern_signatures:
+            sig_len = len(signature)
+            if len(buffer_list) >= sig_len and tuple(buffer_list[-sig_len:]) == signature:
+                return "pattern_match:{}".format("->".join(signature))
+        return ""
+
+    def record_decision(self, allowed, force_status=False):
+        if allowed:
+            self.allowed_events += 1
+        else:
+            self.blocked_events += 1
+        self.flush_status(force=force_status)
+
+    def flush_status(self, force=False):
+        if not self.status_filename:
+            return
+        self.events_since_flush += 1
+        if not force and self.events_since_flush < self.status_flush_interval:
+            return
+
+        payload = self.get_status_snapshot()
+        payload["timestamp_epoch_ms"] = int(time.time() * 1000)
+
+        try:
+            with open(self.status_filename, "w") as status_file:
+                json.dump(payload, status_file, sort_keys=True)
+        except Exception as exc:
+            logging.exception("Unable to write status file %r: %s", self.status_filename, exc)
+
+        self.events_since_flush = 0
+
+    def get_status_snapshot(self):
+        now_ms = current_tick_ms()
+        pause_remaining_ms = max(0, self.pause_until - now_ms)
+        return {
+            "running": self.running,
+            "policy": self.policy,
+            "threshold_ms": self.threshold,
+            "effective_threshold_ms": self.effective_threshold,
+            "average_speed_ms": round(self.average_speed, 2),
+            "total_events": self.total_events,
+            "allowed_events": self.allowed_events,
+            "blocked_events": self.blocked_events,
+            "intrusion_count": self.intrusion_count,
+            "last_intrusion_reason": self.last_intrusion_reason,
+            "last_intrusion_window": self.last_intrusion_window,
+            "last_intrusion_key": self.last_intrusion_key,
+            "pause_remaining_ms": pause_remaining_ms,
+            "adaptive_threshold_enabled": self.adaptive_threshold_enabled,
+            "adaptive_samples": len(self.baseline_intervals),
+        }
+
+    def pause_protection(self, duration_ms=None):
+        duration = duration_ms if duration_ms is not None else self.pause_duration_ms
+        duration = max(1000, int(duration))
+        self.pause_until = current_tick_ms() + duration
+
+    def resume_protection(self):
+        self.pause_until = 0
+
     def handle_intrusion(self, event, reason):
         was_intrusion = self.is_intrusion
         self.is_intrusion = True
+        self.intrusion_count += 1
+        self.last_intrusion_reason = reason
+        self.last_intrusion_window = event.WindowName or ""
+        self.last_intrusion_key = event.Key or ""
+        self.last_intrusion_at_ms = int(time.time() * 1000)
+
         self.log_intrusion(event, reason)
 
         if self.policy == "normal":
@@ -249,7 +440,7 @@ class DuckHunterHook:
 
         if self.policy == "paranoid":
             if not was_intrusion:
-                messagebox.showinfo(
+                show_system_message(
                     "KeyInjection Detected",
                     "Someone might be trying to inject keystrokes into your computer.\n"
                     "Please check your ports or suspicious programs.\n"
@@ -285,7 +476,7 @@ class DuckHunterHook:
         ):
             self.password_counter += 1
             if self.password_counter == len(self.password):
-                messagebox.showinfo("KeyInjection Detected", "Correct Password! Keyboard unlocked.")
+                show_system_message("KeyInjection Detected", "Correct Password! Keyboard unlocked.")
                 self.is_intrusion = False
                 self.password_counter = 0
         else:
@@ -296,20 +487,32 @@ class DuckHunterHook:
         window_name = event.WindowName or ""
         event_time = int(event.Time)
 
+        self.total_events += 1
+
+        # Temporary pause mode for short trusted workflows.
+        if self.pause_until and event_time < self.pause_until:
+            self.record_decision(True)
+            return True
+
         if self.is_window_whitelisted(window_name):
             self.prev_time = event_time
             self.rapid_burst_counter = 0
             self.injected_burst_counter = 0
+            self.record_decision(True)
             return True
 
         if self.policy == "normal" and event_time < self.normal_block_until:
+            self.record_decision(False)
             return False
 
         if self.policy == "paranoid" and self.is_intrusion:
-            return self.handle_paranoid_unlock(event)
+            result = self.handle_paranoid_unlock(event)
+            self.record_decision(result)
+            return result
 
         if self.prev_time == -1:
             self.prev_time = event_time
+            self.record_decision(True)
             return True
 
         interval = max(0, event_time - self.prev_time)
@@ -326,36 +529,60 @@ class DuckHunterHook:
         else:
             self.injected_burst_counter = 0
 
+        key_name = normalize_key_name(event.Key)
+        if key_name:
+            self.key_buffer.append(key_name)
+
+        self.effective_threshold = self.compute_effective_threshold()
+
         self.debug_log(
-            "event key=%r injected=%r interval=%d avg=%.2f rapid=%d injected_streak=%d",
+            "event key=%r injected=%r interval=%d avg=%.2f rapid=%d injected_streak=%d effective=%d",
             event.Key,
             event.Injected,
             interval,
             self.average_speed,
             self.rapid_burst_counter,
             self.injected_burst_counter,
+            self.effective_threshold,
         )
 
         if self.is_window_blacklisted(window_name):
-            return self.handle_intrusion(event, "blacklisted_window")
+            result = self.handle_intrusion(event, "blacklisted_window")
+            self.record_decision(result, force_status=True)
+            return result
 
         if (
             event.Injected and
             self.allow_auto and
             (self.injected_burst_count <= 0 or self.injected_burst_counter < self.injected_burst_count)
         ):
+            self.record_decision(True)
             return True
 
         if self.rapid_burst_count > 0 and self.rapid_burst_counter >= self.rapid_burst_count:
-            return self.handle_intrusion(event, "rapid_burst")
+            result = self.handle_intrusion(event, "rapid_burst")
+            self.record_decision(result, force_status=True)
+            return result
 
         if self.injected_burst_count > 0 and self.injected_burst_counter >= self.injected_burst_count:
-            return self.handle_intrusion(event, "injected_burst")
+            result = self.handle_intrusion(event, "injected_burst")
+            self.record_decision(result, force_status=True)
+            return result
 
-        if self.average_speed < self.threshold:
-            return self.handle_intrusion(event, "average_speed")
+        pattern_reason = self.pattern_match_reason()
+        if pattern_reason:
+            result = self.handle_intrusion(event, pattern_reason)
+            self.record_decision(result, force_status=True)
+            return result
+
+        if self.average_speed < self.effective_threshold:
+            result = self.handle_intrusion(event, "average_speed")
+            self.record_decision(result, force_status=True)
+            return result
 
         self.is_intrusion = False
+        self.remember_clean_interval(interval, event)
+        self.record_decision(True)
         return True
 
     def start(self):
@@ -363,6 +590,7 @@ class DuckHunterHook:
         self.thread_id = windll.kernel32.GetCurrentThreadId()
         pythoncom.CoInitialize()
         self.hm.HookKeyboard()
+        self.flush_status(force=True)
         try:
             pythoncom.PumpMessages()
         except Exception as exc:
@@ -373,6 +601,7 @@ class DuckHunterHook:
             except Exception:
                 pass
             self.running = False
+            self.flush_status(force=True)
             pythoncom.CoUninitialize()
 
     def stop(self):
@@ -429,7 +658,7 @@ class DuckHunterGUI(BaseWindowMixin):
         except Exception:
             pass
         self.window.resizable(False, False)
-        self.window.geometry("370x82+300+300")
+        self.window.geometry("390x92+300+300")
         self.window.attributes("-topmost", True)
         self.dir_path = os.path.dirname(os.path.realpath(__file__))
         self.create_menu()
@@ -465,7 +694,8 @@ class DuckHunterGUI(BaseWindowMixin):
         btn_log.grid(column=2, row=0, padx=5, pady=8)
         btn_close.grid(column=3, row=0, padx=5, pady=8)
 
-        policy_label = Label(self.window, text="Policy: {} | Threshold: {}ms".format(POLICY, THRESHOLD))
+        summary = "Policy: {} | Base threshold: {}ms".format(POLICY, THRESHOLD)
+        policy_label = Label(self.window, text=summary)
         policy_label.grid(column=0, row=1, columnspan=4, pady=(0, 6))
 
     def stop_script(self):
@@ -491,7 +721,7 @@ class DuckHunterControlWindow(BaseWindowMixin):
             self.window.iconbitmap('favicon.ico')
         except Exception:
             pass
-        self.window.geometry("430x82+300+300")
+        self.window.geometry("520x110+300+300")
         self.window.resizable(False, False)
         self.window.attributes("-topmost", True)
 
@@ -515,6 +745,8 @@ class DuckHunterControlWindow(BaseWindowMixin):
         settings_menu = Menu(menubar, tearoff=0)
         settings_menu.add_command(label="RUN SCRIPT ON STARTUP", command=self.add_to_startup)
         settings_menu.add_command(label="OPEN LOG FILE", command=self.open_log_file)
+        settings_menu.add_command(label="PAUSE 30s", command=self.pause_temporarily)
+        settings_menu.add_command(label="RESUME", command=self.resume_now)
         settings_menu.add_command(label="FULLSCREEN", command=self.fullscreen)
         settings_menu.add_command(label="HIDE TITLE BAR", command=self.hide_title_bar)
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -526,19 +758,54 @@ class DuckHunterControlWindow(BaseWindowMixin):
         btn_close = Button(self.window, text="Close Window", width=12, command=self.close_window)
         btn_startup = Button(self.window, text="Run On Startup", width=16, command=self.add_to_startup)
         btn_log = Button(self.window, text="Open Log", width=10, command=self.open_log_file)
+        btn_pause = Button(self.window, text="Pause 30s", width=10, command=self.pause_temporarily)
+        btn_resume = Button(self.window, text="Resume", width=8, command=self.resume_now)
 
         btn_stop.grid(column=0, row=0, padx=5, pady=8)
         btn_close.grid(column=1, row=0, padx=5, pady=8)
         btn_startup.grid(column=2, row=0, padx=5, pady=8)
         btn_log.grid(column=3, row=0, padx=5, pady=8)
+        btn_pause.grid(column=4, row=0, padx=5, pady=8)
+        btn_resume.grid(column=5, row=0, padx=5, pady=8)
 
         self.status_label = Label(self.window, text="Status: active")
-        self.status_label.grid(column=0, row=1, columnspan=4, pady=(0, 6))
+        self.status_label.grid(column=0, row=1, columnspan=6, pady=(0, 6))
 
     def start_hook_async(self):
         self.hook_thread = threading.Thread(target=self.hook.start, name="duckhunt-hook")
         self.hook_thread.daemon = False
         self.hook_thread.start()
+
+    def pause_temporarily(self):
+        self.hook.pause_protection(self.hook.pause_duration_ms)
+        self.update_status_label()
+
+    def resume_now(self):
+        self.hook.resume_protection()
+        self.update_status_label()
+
+    def update_status_label(self):
+        status = self.hook.get_status_snapshot()
+        mode = "paused" if status["pause_remaining_ms"] > 0 else "active"
+        text = (
+            "Status: {} | Intrusions: {} | Blocked: {} | Avg: {}ms | Effective threshold: {}ms"
+            .format(
+                mode,
+                status["intrusion_count"],
+                status["blocked_events"],
+                status["average_speed_ms"],
+                status["effective_threshold_ms"],
+            )
+        )
+        if status["pause_remaining_ms"] > 0:
+            text += " | Pause left: {}ms".format(status["pause_remaining_ms"])
+        if status["last_intrusion_reason"]:
+            text += " | Last: {}".format(status["last_intrusion_reason"])
+        self.status_label.config(text=text)
+
+    def poll_status(self):
+        self.update_status_label()
+        self.window.after(700, self.poll_status)
 
     def close_window(self):
         self.window.destroy()
@@ -554,6 +821,7 @@ class DuckHunterControlWindow(BaseWindowMixin):
 
     def start(self):
         self.start_hook_async()
+        self.poll_status()
         self.window.mainloop()
 
 
