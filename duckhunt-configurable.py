@@ -14,6 +14,7 @@ import statistics
 import sys
 import time
 from collections import deque
+from logging.handlers import RotatingFileHandler
 
 import pythoncom
 
@@ -109,6 +110,48 @@ def parse_pattern_signatures(value):
     return signatures
 
 
+def parse_window_threshold_overrides(value):
+    """Parse 'window:threshold' pairs separated by ';'."""
+    overrides = []
+    if value is None:
+        return overrides
+
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = str(value).split(";")
+
+    for item in raw_items:
+        chunk = str(item).strip()
+        if not chunk or ":" not in chunk:
+            continue
+        name, threshold_text = chunk.split(":", 1)
+        token = name.strip().lower()
+        threshold = as_int(threshold_text.strip(), default=-1, minimum=1)
+        if token and threshold > 0:
+            overrides.append((token, threshold))
+    return overrides
+
+
+def configure_logging(filename, level_name, max_bytes, backup_count):
+    logger = logging.getLogger()
+    logger.handlers = []
+    logger.setLevel(getattr(logging, level_name, logging.INFO))
+
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    if max_bytes > 0:
+        handler = RotatingFileHandler(filename, maxBytes=max_bytes, backupCount=backup_count)
+    else:
+        handler = logging.FileHandler(filename)
+
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
 config = load_config()
 
 THRESHOLD = as_int(getattr(config, "threshold", 30), 30, minimum=1)
@@ -138,17 +181,21 @@ ADAPTIVE_SAMPLE_SIZE = as_int(getattr(config, "adaptive_sample_size", 140), 140,
 ADAPTIVE_MULTIPLIER = as_float(getattr(config, "adaptive_multiplier", 0.35), 0.35, minimum=0.05)
 ADAPTIVE_FLOOR_MS = as_int(getattr(config, "adaptive_floor_ms", 12), 12, minimum=1)
 ADAPTIVE_CEILING_MS = as_int(getattr(config, "adaptive_ceiling_ms", 90), 90, minimum=ADAPTIVE_FLOOR_MS)
+WINDOW_THRESHOLD_OVERRIDES = parse_window_threshold_overrides(getattr(config, "window_threshold_overrides", ""))
+
+# Low-variance detector for machine-like key bursts.
+LOW_VARIANCE_DETECTION = as_bool(getattr(config, "low_variance_detection", True), default=True)
+LOW_VARIANCE_STDDEV_MS = as_float(getattr(config, "low_variance_stddev_ms", 2.5), 2.5, minimum=0.1)
+LOW_VARIANCE_SPEED_CEILING_MS = as_int(getattr(config, "low_variance_speed_ceiling_ms", 55), 55, minimum=1)
+LOW_VARIANCE_STREAK_COUNT = as_int(getattr(config, "low_variance_streak_count", 6), 6, minimum=1)
 
 # Optional runtime status export
 STATUS_FILENAME = str(getattr(config, "status_filename", ""))
 STATUS_FLUSH_INTERVAL = as_int(getattr(config, "status_flush_interval", 250), 250, minimum=1)
+LOG_MAX_BYTES = as_int(getattr(config, "log_max_bytes", 1048576), 1048576, minimum=0)
+LOG_BACKUP_COUNT = as_int(getattr(config, "log_backup_count", 5), 5, minimum=1)
 
-logging.basicConfig(
-    filename=LOG_FILENAME,
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='[%(asctime)s] %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+configure_logging(LOG_FILENAME, LOG_LEVEL, LOG_MAX_BYTES, LOG_BACKUP_COUNT)
 
 
 class DuckHunter:
@@ -167,6 +214,7 @@ class DuckHunter:
         self.injected_burst_count = INJECTED_BURST_COUNT
         self.pattern_signatures = PATTERN_SIGNATURES
         self.key_buffer = deque(maxlen=KEY_BUFFER_SIZE)
+        self.window_threshold_overrides = WINDOW_THRESHOLD_OVERRIDES
 
         self.adaptive_threshold_enabled = ADAPTIVE_THRESHOLD_ENABLED
         self.adaptive_min_samples = ADAPTIVE_MIN_SAMPLES
@@ -175,6 +223,12 @@ class DuckHunter:
         self.adaptive_ceiling_ms = ADAPTIVE_CEILING_MS
         self.baseline_intervals = deque(maxlen=ADAPTIVE_SAMPLE_SIZE)
         self.effective_threshold = self.threshold
+        self.active_threshold = self.threshold
+
+        self.low_variance_detection = LOW_VARIANCE_DETECTION
+        self.low_variance_stddev = LOW_VARIANCE_STDDEV_MS
+        self.low_variance_speed_ceiling = LOW_VARIANCE_SPEED_CEILING_MS
+        self.low_variance_streak_count = LOW_VARIANCE_STREAK_COUNT
 
         self.status_filename = STATUS_FILENAME.strip()
         self.status_flush_interval = STATUS_FLUSH_INTERVAL
@@ -185,7 +239,9 @@ class DuckHunter:
         self.history = [self.threshold + 1] * self.history_size
         self.history_index = 0
         self.history_total = float(sum(self.history))
+        self.history_square_total = float(sum(value * value for value in self.history))
         self.average_speed = self.history_total / self.history_size
+        self.interval_stddev = 0.0
 
         self.previous_time = -1
         self.is_intrusion = False
@@ -195,6 +251,7 @@ class DuckHunter:
         self.normal_block_until = 0
         self.rapid_burst_counter = 0
         self.injected_burst_counter = 0
+        self.low_variance_counter = 0
 
         self.total_events = 0
         self.allowed_events = 0
@@ -220,12 +277,25 @@ class DuckHunter:
         lowered = (window_name or "").lower()
         return any(token in lowered for token in self.blacklist)
 
+    def get_window_threshold_override(self, window_name):
+        lowered = (window_name or "").lower()
+        for token, threshold in self.window_threshold_overrides:
+            if token in lowered:
+                return threshold
+        return None
+
     def update_interval_metrics(self, interval):
         old_value = self.history[self.history_index]
         self.history[self.history_index] = interval
         self.history_index = (self.history_index + 1) % self.history_size
         self.history_total += interval - old_value
         self.average_speed = self.history_total / float(self.history_size)
+        mean = self.average_speed
+        self.history_square_total += (interval * interval) - (old_value * old_value)
+        variance = (self.history_square_total / float(self.history_size)) - (mean * mean)
+        if variance < 0:
+            variance = 0
+        self.interval_stddev = variance ** 0.5
 
     def compute_effective_threshold(self):
         if not self.adaptive_threshold_enabled:
