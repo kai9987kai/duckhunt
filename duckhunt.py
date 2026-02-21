@@ -7,6 +7,8 @@
 ######################################################
 
 This script monitors keyboard input to detect potential keystroke injection attacks.
+
+MIT License
 """
 
 import importlib.util
